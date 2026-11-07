@@ -24,12 +24,49 @@ const maxMentions = Number.parseInt(process.env.MAX_MENTIONS ?? '5', 10);
 const spamLimit = Number.parseInt(process.env.SPAM_LIMIT ?? '5', 10);
 const spamWindowMs = Number.parseInt(process.env.SPAM_WINDOW_MS ?? '8000', 10);
 const timeoutSeconds = Number.parseInt(process.env.TIMEOUT_SECONDS ?? '60', 10);
+const aiModerationEnabled = process.env.AI_MODERATION_ENABLED !== 'false' && Boolean(process.env.OPENAI_API_KEY);
+const aiTimeoutSeconds = Number.parseInt(process.env.AI_MODERATION_TIMEOUT_SECONDS ?? '0', 10);
 const recentMessages = new Map();
 const invitePattern = /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/[\w-]+/i;
+
+async function checkWithAiModeration(text) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/moderations', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODERATION_MODEL || 'omni-moderation-latest',
+        input: text.slice(0, 10000),
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`OpenAI Moderation API respondeu com HTTP ${response.status}`);
+    }
+
+    const result = (await response.json()).results?.[0];
+    return {
+      flagged: result?.flagged === true,
+      categories: Object.entries(result?.categories ?? {})
+        .filter(([, flagged]) => flagged)
+        .map(([category]) => category),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Bot conectado como ${readyClient.user.tag}`);
   console.log(`Moderação automática ${automodEnabled ? 'ativada' : 'desativada'}.`);
+  console.log(`Moderação com IA ${aiModerationEnabled ? 'ativada' : 'desativada (configure OPENAI_API_KEY).'}.`);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -39,8 +76,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
-  if (!automodEnabled || !message.inGuild() || message.author.bot) return;
-
+  if (!message.inGuild() || message.author.bot) return;
   if (message.member?.permissions.has('ManageMessages')) return;
 
   const mentionCount = message.mentions.users.size + message.mentions.roles.size;
@@ -56,7 +92,18 @@ client.on(Events.MessageCreate, async (message) => {
   const isFlood = recent.length >= spamLimit || repeatedCount >= 3;
   const isMentionSpam = maxMentions > 0 && mentionCount >= maxMentions;
 
-  if (!containsInvite && !isFlood && !isMentionSpam) return;
+  let aiResult = { flagged: false, categories: [] };
+  if (automodEnabled && aiModerationEnabled && message.content.trim()) {
+    try {
+      aiResult = await checkWithAiModeration(message.content);
+    } catch (error) {
+      // Fail open on API/network errors: conventional rules below still apply.
+      console.error('Falha ao verificar a mensagem com a moderação de IA.', error);
+    }
+  }
+
+  const ruleViolation = automodEnabled && (containsInvite || isFlood || isMentionSpam);
+  if (!ruleViolation && !aiResult.flagged) return;
 
   try {
     await message.delete();
@@ -64,11 +111,18 @@ client.on(Events.MessageCreate, async (message) => {
       containsInvite && 'link de convite',
       isFlood && 'spam',
       isMentionSpam && 'menções excessivas',
+      aiResult.flagged && `conteúdo sinalizado pela IA${aiResult.categories.length ? ` (${aiResult.categories.join(', ')})` : ''}`,
     ].filter(Boolean).join(', ');
     console.log(`Automod removeu mensagem de ${message.author.tag} em ${message.guild.name}: ${reasons}.`);
 
-    if ((isFlood || isMentionSpam) && timeoutSeconds > 0 && message.member?.moderatable) {
-      await message.member.timeout(timeoutSeconds * 1000, `Moderação automática: ${reasons}`);
+    const shouldTimeout = (isFlood || isMentionSpam) && timeoutSeconds > 0
+      || aiResult.flagged && aiTimeoutSeconds > 0;
+    const durationSeconds = aiResult.flagged && aiTimeoutSeconds > 0
+      ? aiTimeoutSeconds
+      : timeoutSeconds;
+
+    if (shouldTimeout && message.member?.moderatable) {
+      await message.member.timeout(durationSeconds * 1000, `Moderação automática: ${reasons}`);
     }
   } catch (error) {
     console.error(`Automod não conseguiu moderar a mensagem em ${message.guild.name}.`, error);
